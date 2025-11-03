@@ -75,7 +75,7 @@ def termination_extension_routes(router, options):
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="Upload expired")
 
         # Delete the file and metadata for the upload from the mapping
-        file.delete(uuid)
+        await file.delete(uuid)
 
         # Return a 204 No Content response
         response.headers["Tus-Resumable"] = options.tus_version

@@ -106,10 +106,10 @@ class FileLock:
             if self._lock_fd is not None:
                 try:
                     os.close(self._lock_fd)
-                except Exception:
-                    pass
+                except (IOError, OSError) as close_err:
+                    logger.warning(f"Error closing lock file descriptor during cleanup: {close_err}")
                 self._lock_fd = None
-            
+
             if not blocking and e.errno in (11, 35):  # EAGAIN/EWOULDBLOCK
                 return False
             raise
@@ -120,17 +120,20 @@ class FileLock:
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
                 os.close(self._lock_fd)
-            except Exception as e:
+            except (IOError, OSError) as e:
                 logger.warning(f"Error releasing lock file descriptor: {e}")
             finally:
                 self._lock_fd = None
-            
+
             # Remove the lock file (tusd does this)
             # Note: We remove the lock file but keep the .locks directory
             try:
                 if os.path.exists(self.lock_file_path):
                     os.remove(self.lock_file_path)
-            except Exception as e:
+            except FileNotFoundError:
+                # Lock file already removed (race condition), expected
+                pass
+            except (IOError, OSError) as e:
                 logger.warning(f"Error removing lock file {self.lock_file_path}: {e}")
     
     def get_fd(self) -> Optional[int]:

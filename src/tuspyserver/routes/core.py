@@ -249,7 +249,7 @@ def core_routes(router, options):
             new_params.expires = _format_rfc7231_date(date_expiry)
 
         # save param changes
-        file.info = new_params
+        await file._info.update_params(new_params)
 
         if file.info.size == file.info.offset:
             response.headers["Tus-Resumable"] = options.tus_version

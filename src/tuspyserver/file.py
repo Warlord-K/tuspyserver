@@ -6,6 +6,8 @@ from typing import List, Optional
 if typing.TYPE_CHECKING:
     from tuspyserver.router import TusRouterOptions
 
+import aiofiles
+import aiofiles.os
 import datetime
 import os
 from uuid import uuid4
@@ -92,20 +94,20 @@ class TusUploadFile:
     def create(self) -> None:
         open(self.path, "a").close()
 
-    def read(self) -> Optional[bytes]:
+    async def read(self) -> Optional[bytes]:
         if self.exists:
-            with open(self.path, "rb") as f:
-                return f.read()
+            async with aiofiles.open(self.path, "rb") as f:
+                return await f.read()
         return None
 
-    def delete(self, uid: str) -> None:
+    async def delete(self, uid: str) -> None:
         if os.path.exists(self.path):
-            os.remove(self.path)
+            await aiofiles.os.remove(self.path)
 
         # Only try to delete info file if info exists
         if self.info is not None and hasattr(self._info, "path"):
             if os.path.exists(self._info.path):
-                os.remove(self._info.path)
+                await aiofiles.os.remove(self._info.path)
 
     def __len__(self) -> int:
         if self.exists:
@@ -117,7 +119,7 @@ def list_files(options: TusRouterOptions) -> List[str]:
     return [f for f in os.listdir(options.files_dir) if len(f) == 32]
 
 
-def gc_files(options: TusRouterOptions):
+async def gc_files(options: TusRouterOptions):
     for uid in list_files(options):
         file = TusUploadFile(uid=uid, options=options)
         if (
@@ -127,4 +129,4 @@ def gc_files(options: TusRouterOptions):
             and datetime.datetime.fromisoformat(file.info.expires)
             < datetime.datetime.now()
         ):
-            file.delete(uid)
+            await file.delete(uid)

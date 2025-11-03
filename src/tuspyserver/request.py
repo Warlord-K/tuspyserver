@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import aiofiles
 import datetime
+import logging
 import os
 import typing
 from typing import Callable, Optional
@@ -16,6 +18,8 @@ from starlette.requests import ClientDisconnect
 
 from tuspyserver.file import TusUploadFile
 from tuspyserver.lock import acquire_upload_lock
+
+logger = logging.getLogger(__name__)
 
 
 def make_request_chunks_dep(options: TusRouterOptions):
@@ -107,17 +111,18 @@ def make_request_chunks_dep(options: TusRouterOptions):
                 total_bytes_written = 0
 
                 # process chunk stream - lock is held during entire operation
-                with open(upload_path, "ab") as f:
+                # Using aiofiles for non-blocking writes
+                async with aiofiles.open(upload_path, "ab") as f:
                     try:
                         async for chunk in request.stream():
                             has_chunks = True
                             # skip empty chunks but continue processing
                             if len(chunk) == 0:
                                 continue
-                            
+
                             # Calculate new offset based on validated offset + bytes written so far
                             new_offset = validated_offset + total_bytes_written
-                            
+
                             # Check if upload would exceed declared size
                             if (
                                 new_params.size is not None
@@ -133,40 +138,65 @@ def make_request_chunks_dep(options: TusRouterOptions):
                                     status_code=413,
                                     detail="Upload exceeds maximum allowed size",
                                 )
-                            # write chunk otherwise
-                            f.write(chunk)
-                            f.flush()  # Ensure data is written to disk immediately
+                            # write chunk otherwise - non-blocking with aiofiles
+                            await f.write(chunk)
+                            await f.flush()  # Ensure data is written to disk immediately
                             total_bytes_written += len(chunk)
-                        
+
                         # After all chunks are written, update params atomically
                         # Lock is still held here, so this is safe
                         new_params.offset = validated_offset + total_bytes_written
                         new_params.upload_chunk_size = total_bytes_written if total_bytes_written > 0 else 0
                         new_params.upload_part += 1
                         # Save updated params (atomic write while lock is held)
-                        file.info = new_params
-                        
+                        # Using async serialize for non-blocking write
+                        await file._info.update_params(new_params)
+
                     except HTTPException:
                         # HTTPExceptions should propagate - don't catch them here
                         # The lock will be released by the context manager
                         raise
                     except ClientDisconnect:
-                        # Save the current offset before returning, so resume works correctly
+                        # Client disconnected during upload - save progress for resumption
+                        logger.info(f"Client disconnected during upload {file.uid}, saved offset: {validated_offset + total_bytes_written}")
                         # Lock is still held, so this is safe
                         new_params.offset = validated_offset + total_bytes_written
                         new_params.upload_chunk_size = total_bytes_written if total_bytes_written > 0 else 0
                         new_params.upload_part += 1
-                        file.info = new_params
+                        await file._info.update_params(new_params)
                         return False
-                    except Exception as e:
-                        # save the error
-                        new_params.error = str(e)
+                    except (IOError, OSError) as io_err:
+                        # I/O errors during upload (disk full, permissions, network issues)
+                        logger.error(f"I/O error during upload {file.uid}: {io_err}")
+                        # Save partial progress so client can resume from correct offset
+                        new_params.error = f"I/O error: {str(io_err)}"
                         new_params.offset = validated_offset + total_bytes_written
                         # save updated params
-                        file.info = new_params
-                        return False
-                    finally:
-                        f.close()
+                        try:
+                            await file._info.update_params(new_params)
+                        except Exception as save_err:
+                            logger.error(f"Failed to save error state for upload {file.uid}: {save_err}")
+                        # Re-raise as HTTPException so client gets proper error response
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"I/O error during upload: {str(io_err)}"
+                        )
+                    except Exception as e:
+                        # Unexpected errors (programming bugs, etc.)
+                        logger.exception(f"Unexpected error during upload {file.uid}: {e}")
+                        # Save partial progress
+                        new_params.error = f"Unexpected error: {str(e)}"
+                        new_params.offset = validated_offset + total_bytes_written
+                        # save updated params
+                        try:
+                            await file._info.update_params(new_params)
+                        except Exception as save_err:
+                            logger.error(f"Failed to save error state for upload {file.uid}: {save_err}")
+                        # Re-raise as HTTPException
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Upload failed: {str(e)}"
+                        )
 
                 # For empty files in a POST request, we still want to return True
                 # to ensure the file gets created properly
@@ -177,9 +207,10 @@ def make_request_chunks_dep(options: TusRouterOptions):
                     new_params.upload_chunk_size = 0
                     new_params.upload_part += 1
                     # save updated params
-                    file.info = new_params
+                    await file._info.update_params(new_params)
         except (IOError, OSError) as e:
             # Lock acquisition or file operation failed
+            logger.error(f"Failed to acquire lock or perform file operation for upload {uuid}: {e}")
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
         return True

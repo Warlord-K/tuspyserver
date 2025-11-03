@@ -1,6 +1,9 @@
+import aiofiles
+import aiofiles.os
 import base64
 from copy import deepcopy
 import inspect
+import logging
 import os
 from datetime import datetime, timedelta
 from email.utils import formatdate
@@ -11,6 +14,8 @@ from fastapi import Depends, Header, HTTPException, Request, Response, status
 
 from tuspyserver.file import TusUploadFile, TusUploadParams
 from tuspyserver.request import get_request_headers
+
+logger = logging.getLogger(__name__)
 
 
 def _format_rfc7231_date(dt: datetime) -> str:
@@ -270,15 +275,24 @@ def creation_extension_routes(router, options):
                         if body and len(body) > 0:
                             initial_data_size = len(body)
                             # Write initial data to file
-                            with open(file.path, "ab") as f:
-                                f.write(body)
-                                f.flush()
-                            # Update offset
-                            params.offset += len(body)
-                            params.upload_part += 1
-                            file.info = params
-                    except Exception:
-                        # If body was already consumed or other error, skip
+                            try:
+                                async with aiofiles.open(file.path, "ab") as f:
+                                    await f.write(body)
+                                    await f.flush()
+                                # Update offset
+                                params.offset += len(body)
+                                params.upload_part += 1
+                                await file._info.update_params(params)
+                            except (IOError, OSError) as io_err:
+                                logger.error(f"Failed to write initial upload data for {file.uid}: {io_err}")
+                                raise HTTPException(
+                                    status_code=500,
+                                    detail=f"Failed to write initial upload data: {str(io_err)}"
+                                )
+                    except RuntimeError:
+                        # Body was already consumed by middleware or another handler
+                        # This is expected in some configurations, skip gracefully
+                        logger.debug(f"Request body already consumed for upload {file.uid}, skipping initial data")
                         pass
             except (ValueError, TypeError):
                 pass  # Invalid content-length, ignore
@@ -291,23 +305,24 @@ def creation_extension_routes(router, options):
             try:
                 # Concatenate all partial files into the final file using chunked copying
                 # This prevents memory issues with large files (e.g., 100GB+)
-                CHUNK_SIZE = 5 * 1024 * 1024  # 5MB chunks
+                # Use configurable chunk size from options
+                CHUNK_SIZE = file_options.chunk_size
 
-                with open(final_path, "wb") as final_f:
+                async with aiofiles.open(final_path, "wb") as final_f:
                     for partial_file in partial_files:
                         partial_path = partial_file.path
 
                         # Copy file in chunks to avoid loading entire file into memory
-                        with open(partial_path, "rb") as partial_f:
+                        async with aiofiles.open(partial_path, "rb") as partial_f:
                             while True:
-                                chunk = partial_f.read(CHUNK_SIZE)
+                                chunk = await partial_f.read(CHUNK_SIZE)
                                 if not chunk:
                                     break
-                                final_f.write(chunk)
+                                await final_f.write(chunk)
                                 bytes_written += len(chunk)
 
                     # Ensure all data is written to disk before proceeding
-                    final_f.flush()
+                    await final_f.flush()
                     os.fsync(final_f.fileno())
 
                 # Verify we wrote the expected amount of data
@@ -318,32 +333,77 @@ def creation_extension_routes(router, options):
 
                 # Update the offset to indicate the upload is complete
                 params.offset = final_size
-                file.info = params
+                await file._info.update_params(params)
 
                 # Delete all partial uploads after successful concatenation
                 # Handle race conditions where partials might already be deleted
                 for partial_file in partial_files:
                     try:
-                        partial_file.delete(partial_file.uid)
+                        await partial_file.delete(partial_file.uid)
                     except FileNotFoundError:
-                        # Partial already deleted (race condition or retry), ignore
+                        # Partial already deleted (race condition or retry), this is expected
+                        logger.debug(f"Partial upload {partial_file.uid} already deleted, skipping")
                         pass
-                    except Exception as delete_error:
-                        # Log but don't fail the concat - final file is already good
-                        import logging
-                        logger = logging.getLogger(__name__)
-                        logger.warning(
-                            f"Failed to delete partial {partial_file.uid}: {delete_error}"
+                    except PermissionError as perm_err:
+                        # Permission error - this is a problem but don't fail the whole operation
+                        # since the final file is already concatenated successfully
+                        logger.error(
+                            f"Permission denied when deleting partial {partial_file.uid}: {perm_err}. "
+                            f"Manual cleanup may be required."
+                        )
+                    except (IOError, OSError) as io_err:
+                        # I/O errors (disk issues, network storage problems, etc.)
+                        logger.error(
+                            f"I/O error when deleting partial {partial_file.uid}: {io_err}. "
+                            f"Manual cleanup may be required."
+                        )
+                    except Exception as unexpected_err:
+                        # Unexpected error - log with full stack trace for debugging
+                        logger.exception(
+                            f"Unexpected error when deleting partial {partial_file.uid}: {unexpected_err}. "
+                            f"This may indicate a bug. Manual cleanup may be required."
                         )
 
-            except Exception as e:
+            except (IOError, OSError) as io_err:
+                # I/O errors during concatenation (disk full, network issues, permissions)
+                logger.error(f"I/O error during concatenation for upload {file.uid}: {io_err}")
                 # Clean up the final file if concatenation fails
                 # This ensures we don't leave corrupted files around
                 try:
                     if file.exists:
-                        file.delete(file.uid)
-                except Exception:
-                    pass  # Best effort cleanup
+                        await file.delete(file.uid)
+                        logger.info(f"Cleaned up corrupted final file {file.uid} after I/O error")
+                except FileNotFoundError:
+                    # File already gone, that's fine
+                    pass
+                except Exception as cleanup_err:
+                    # Cleanup failed - log it but still raise the original error
+                    logger.error(
+                        f"Failed to cleanup corrupted file {file.uid} after concatenation error: {cleanup_err}. "
+                        f"Manual cleanup may be required."
+                    )
+
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to concatenate uploads due to I/O error: {str(io_err)}"
+                )
+            except Exception as e:
+                # Unexpected errors (programming bugs, etc.)
+                logger.exception(f"Unexpected error during concatenation for upload {file.uid}: {e}")
+                # Clean up the final file if concatenation fails
+                try:
+                    if file.exists:
+                        await file.delete(file.uid)
+                        logger.info(f"Cleaned up corrupted final file {file.uid} after unexpected error")
+                except FileNotFoundError:
+                    # File already gone, that's fine
+                    pass
+                except Exception as cleanup_err:
+                    # Cleanup failed - log it but still raise the original error
+                    logger.error(
+                        f"Failed to cleanup corrupted file {file.uid} after concatenation error: {cleanup_err}. "
+                        f"Manual cleanup may be required."
+                    )
 
                 raise HTTPException(
                     status_code=500,
