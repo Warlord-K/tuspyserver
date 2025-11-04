@@ -113,13 +113,13 @@ def core_routes(router, options):
                 )
 
             filetype = file.info.metadata.get("filetype") or file.info.metadata.get("type")
-            if filetype is None:
-                error_msg = f"Upload-Metadata missing required field: filetype (metadata: {file.info.metadata})"
-                logger.error(f"HEAD {uuid}: {error_msg}")
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=error_msg,
-                )
+            # if filetype is None:
+            #     error_msg = f"Upload-Metadata missing required field: filetype (metadata: {file.info.metadata})"
+            #     logger.error(f"HEAD {uuid}: {error_msg}")
+            #     raise HTTPException(
+            #         status_code=status.HTTP_400_BAD_REQUEST,
+            #         detail=error_msg,
+            #     )
 
         def b64(s: str) -> str:
             return base64.b64encode(s.encode("utf-8")).decode("ascii")
